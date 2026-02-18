@@ -1,0 +1,156 @@
+## =======================
+## Monthly weather summary
+## =======================
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+# library(readxl)
+# weather <- read_excel("PATH/TO/YOUR/PIVOT_TABLE.xlsx")
+
+## ---- Clean pivot table into monthly data ----
+
+months_vec <- month.name  # "January" ... "December"
+
+weather_tidy <- weather %>%
+  mutate(
+    is_month    = `Row Labels` %in% months_vec,
+    is_year     = grepl("^[0-9]{4}$", `Row Labels`),
+    is_location = !(is_month | is_year),
+    location    = if_else(is_location, `Row Labels`, NA_character_),
+    year        = if_else(is_year,      `Row Labels`, NA_character_)
+  ) %>%
+  tidyr::fill(location, year, .direction = "down") %>%
+  filter(is_month) %>%
+  transmute(
+    location,
+    year   = as.integer(year),
+    month  = factor(`Row Labels`,
+                    levels = c("October","November","December",
+                               "January","February","March",
+                               "April","May","June","July",
+                               "August","September"),
+                    ordered = TRUE),
+    precip   = `Sum of precipitation`,
+    min_temp = `Min of min.temp`,
+    avg_temp = `Average of avg.temp`,
+    max_temp = `Max of max.temp`,
+    hum      = `Average of air.humidity`
+  )
+
+## ---- Define growing seasons (October–August) ----
+
+weather_season <- weather_tidy %>%
+  filter(month %in% c("October","November","December",
+                      "January","February","March",
+                      "April","May","June","July","August")) %>%
+  mutate(
+    harvest_year = if_else(month %in% c("October","November","December"),
+                           year + 1L, year),
+    sowing_year  = harvest_year - 1L,
+    season       = paste0(sowing_year, "–", harvest_year)
+  )
+
+## ---- Keep only selected trials (IFVCNS, JKI, NORDSAAT, UGENT) ----
+
+plot_data <- weather_season %>%
+  filter(
+    # IFVCNS 2022–2023 (harvest 2023)
+    (location == "IFVCNS" & harvest_year == 2023L) |
+      # JKI 2022–2023
+      (location == "JKI"    & harvest_year == 2023L) |
+      # NORDSAAT 2022–2023 (location can be "NORD" or "NORDSAAT")
+      (location %in% c("NORD","NORDSAAT") & harvest_year == 2023L) |
+      # UGENT year1 2021–2022 (harvest 2022)
+      (location == "UGENT"  & harvest_year == 2022L) |
+      # UGENT year2 2022–2023 (harvest 2023)
+      (location == "UGENT"  & harvest_year == 2023L)
+  ) %>%
+  mutate(
+    month_short = factor(substr(as.character(month), 1, 3),
+                         levels = c("Oct","Nov","Dec",
+                                    "Jan","Feb","Mar",
+                                    "Apr","May","Jun","Jul","Aug"),
+                         ordered = TRUE),
+    facet_label = dplyr::case_when(
+      location == "IFVCNS"               & harvest_year == 2023L ~ "IFVCNS (2022–2023)",
+      location == "JKI"                  & harvest_year == 2023L ~ "JKI (2022–2023)",
+      location %in% c("NORD","NORDSAAT") & harvest_year == 2023L ~ "NORDSAAT (2022–2023)",
+      location == "UGENT"                & harvest_year == 2022L ~ "UGENT year1 (2021–2022)",
+      location == "UGENT"                & harvest_year == 2023L ~ "UGENT year2 (2022–2023)",
+      TRUE ~ paste(location, "(", season, ")")
+    ),
+    facet_label = factor(
+      facet_label,
+      levels = c("IFVCNS (2022–2023)",
+                 "JKI (2022–2023)",
+                 "NORDSAAT (2022–2023)",
+                 "UGENT year1 (2021–2022)",
+                 "UGENT year2 (2022–2023)")
+    )
+  )
+
+## ---- Scaling for precipitation (secondary axis) ----
+
+temp_range <- range(c(plot_data$min_temp, plot_data$max_temp), na.rm = TRUE)
+temp_span  <- diff(temp_range)
+if (!is.finite(temp_span) || temp_span == 0) temp_span <- 1
+
+precip_max <- max(plot_data$precip, na.rm = TRUE)
+if (!is.finite(precip_max) || precip_max == 0) precip_max <- 1
+
+scale_precip <- temp_span / (precip_max * 1.1)
+
+## ---- Final ggplot: Oct–Aug, lines + bars ----
+
+p <- ggplot(plot_data, aes(x = month_short)) +
+  geom_col(aes(y = precip * scale_precip),
+           fill  = "steelblue1",
+           width = 0.7,
+           alpha = 0.6) +
+  
+  geom_line(aes(y = max_temp, colour = "Max", group = 1),
+            linewidth = 0.9) +
+  geom_point(aes(y = max_temp, colour = "Max"), size = 1.8) +
+  
+  geom_line(aes(y = avg_temp, colour = "Average", group = 1),
+            linewidth = 0.9) +
+  geom_point(aes(y = avg_temp, colour = "Average"), size = 1.8) +
+  
+  geom_line(aes(y = min_temp, colour = "Min", group = 1),
+            linewidth = 0.9) +
+  geom_point(aes(y = min_temp, colour = "Min"), size = 1.8) +
+  
+  facet_wrap(~ facet_label, nrow = 2) +
+  
+  scale_y_continuous(
+    name = "Temperature (°C)",
+    sec.axis = sec_axis(~ . / scale_precip,
+                        name = "Monthly precipitation (mm)")
+  ) +
+  scale_colour_manual(
+    values = c("Max"     = "red3",
+               "Average" = "forestgreen",
+               "Min"     = "blue3"),
+    labels = c("Max temperature",
+               "Average temperature",
+               "Min temperature"),
+    name   = NULL
+  ) +
+  labs(
+    x = "Month of the growing season (October–August)",
+    title = "Monthly summary of meteorological data for selected environments"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    panel.grid.minor   = element_blank(),
+    strip.background   = element_rect(fill = "grey90"),
+    strip.text         = element_text(face = "bold"),
+    axis.text.x        = element_text(angle = 45, hjust = 1),
+    legend.position    = "top",
+    legend.direction   = "horizontal",
+    legend.title       = element_blank(),
+    plot.title         = element_text(hjust = 0.5, face = "bold")
+  )
+
+print(p)
