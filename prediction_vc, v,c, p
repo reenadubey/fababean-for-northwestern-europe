@@ -1,0 +1,489 @@
+
+# -----------------------------------
+# Parallelized & Optimized Pipeline
+# -----------------------------------
+
+# 1) Load Libraries
+library(readxl)
+library(signal)
+library(baseline)
+library(ggplot2)
+library(caret)
+library(tidyr)
+library(openxlsx)
+library(stringr)
+library(dplyr)
+library(doParallel)
+library(foreach)
+library(pls)
+
+set.seed(123)
+start_time <- Sys.time()
+
+# 2) Setup directories
+setwd("/data/home/rdubey/NIRS_cali")
+root_dir   <- getwd()
+output_dir <- "model_outputs"
+dirs       <- c("models","predictions","splits","plots","summaries")
+for (d in dirs) dir.create(file.path(root_dir, output_dir, d), showWarnings = FALSE, recursive = TRUE)
+model_dir   <- file.path(root_dir, output_dir, "models")
+preds_dir   <- file.path(root_dir, output_dir, "predictions")
+splits_dir  <- file.path(root_dir, output_dir, "splits")
+plots_dir   <- file.path(root_dir, output_dir, "plots")
+summary_dir <- file.path(root_dir, output_dir, "summaries")
+
+# 3) Load and preprocess data
+spectral_data <- read_excel("absorbance_vc.xlsx")
+chemdata      <- read_excel("hplc_vc.xlsx")
+chemdata <- chemdata[, c("variety","Convicin_dry","Vicin_dry","VC dry","protein_dried")]
+colnames(chemdata)[1] <- "Sample"
+colnames(spectral_data)[2] <- "Sample"
+chemdata$Sample <- as.character(chemdata$Sample)
+spectral_data$Sample <- as.character(spectral_data$Sample)
+
+orig <- c("Convicin_dry","Vicin_dry","VC dry","protein_dried")
+new  <- c("Convicin","Vicin","VC","Protein")
+keep <- orig %in% colnames(chemdata)
+chemdata <- rename(chemdata, !!!setNames(orig[keep], new[keep]))
+
+matched_data    <- inner_join(chemdata, spectral_data, by = "Sample")
+spectral_matrix <- as.data.frame(lapply(matched_data[,-(1:7)], as.numeric))
+spectral_matrix[is.na(spectral_matrix)] <- 0
+
+# 4) Define preprocessing functions
+apply_baseline_correction <- function(dat) {
+  t(apply(dat, 1, function(x) baseline(matrix(x,1), method = "als")@corrected))
+}
+msc <- function(dat) {
+  msp <- colMeans(dat)
+  t(apply(dat, 1, function(x) {
+    slope     <- sum((x - mean(x)) * (msp - mean(msp))) / sum((msp - mean(msp))^2)
+    intercept <- mean(x) - slope * mean(msp)
+    (x - intercept) / slope
+  }))
+}
+snv <- function(dat) t(apply(dat, 1, function(x) (x - mean(x)) / sd(x)))
+sg  <- function(dat, m, p, w) t(apply(dat, 1, function(x) sgolayfilt(x, p, w, m = m)))
+
+sg_params <- expand.grid(m = c(0,1), p = c(2,3), w = c(5,7,9,11,15))
+sg_params <- filter(sg_params, w > p & w %% 2 == 1)
+
+preprocess_list <- list(
+  msc          = msc,
+  snv          = snv,
+  snv_msc      = function(d) msc(snv(d)),
+  baseline_c   = apply_baseline_correction,
+  base_snv_msc = function(d) msc(snv(apply_baseline_correction(d)))
+)
+for (i in seq_len(nrow(sg_params))) {
+  m_i <- sg_params$m[i]; p_i <- sg_params$p[i]; w_i <- sg_params$w[i]
+  key1 <- paste0("sg_m", m_i, "_p", p_i, "_w", w_i)
+  preprocess_list[[key1]] <- local({ m0 <- m_i; p0 <- p_i; w0 <- w_i; function(dat) sg(dat, m0, p0, w0) })
+  key2 <- paste0("snv_sg_m", m_i, "_p", p_i, "_w", w_i)
+  preprocess_list[[key2]] <- local({ m0 <- m_i; p0 <- p_i; w0 <- w_i; function(dat) sg(snv(dat), m0, p0, w0) })
+  key3 <- paste0("base_snv_sg_m", m_i, "_p", p_i, "_w", w_i)
+  preprocess_list[[key3]] <- local({ m0 <- m_i; p0 <- p_i; w0 <- w_i; function(dat) sg(snv(apply_baseline_correction(dat)), m0, p0, w0) })
+}
+
+# 5) Splitting function
+split_validation_by_bins <- function(y, n_bins = 10, n_per_bin = 1) {
+  bc <- cut(y, breaks = n_bins, labels = FALSE)
+  val <- unlist(lapply(1:n_bins, function(b) {
+    idx <- which(bc == b)
+    if (length(idx) >= n_per_bin) sample(idx, n_per_bin) else idx
+  }))
+  list(train = setdiff(seq_along(y), val), val = unique(val))
+}
+
+# 6) Modeling parameters
+targets     <- c("Convicin","Vicin","VC","Protein")
+folds       <- c(5,10,25,50)
+main_iters  <- 10
+inner_iters <- 25
+
+# 7) Build outer grid
+combos <- expand.grid(
+  main_iter = 1:main_iters,
+  target    = targets,
+  method    = names(preprocess_list),
+  stringsAsFactors = FALSE
+)
+
+# 8) Start cluster & set working directory on workers
+closeAllConnections()
+num_cores <- detectCores() - 10
+cl <- makeCluster(num_cores)
+registerDoParallel(cl)
+clusterSetRNGStream(cl, 123)
+clusterEvalQ(cl, setwd(root_dir))
+clusterExport(cl, varlist = c(
+  "matched_data","spectral_matrix","preprocess_list",
+  "split_validation_by_bins","snv","msc","sg",
+  "apply_baseline_correction","model_dir","preds_dir",
+  "splits_dir","plots_dir","inner_iters","folds"
+))
+
+# 9) Parallel foreach (outer loop)
+results_list <- foreach(
+  combo     = iter(combos, by = 'row'),
+  .packages = c("caret","pls","dplyr","signal","baseline")
+) %dopar% {
+  mi  <- combo$main_iter; tgt <- combo$target; mth <- combo$method
+  y_full <- as.numeric(matched_data[[tgt]])
+  valid  <- !is.na(y_full)
+  y      <- y_full[valid]
+  X_raw  <- spectral_matrix[valid, , drop = FALSE]
+  
+  Xp_raw <- preprocess_list[[mth]](X_raw)
+  X_proc <- if (is.vector(Xp_raw)) matrix(Xp_raw, nrow = nrow(X_raw), byrow = TRUE) else as.matrix(Xp_raw)
+  colnames(X_proc) <- colnames(X_raw)
+  
+  sp <- split_validation_by_bins(y)
+  saveRDS(sp, file.path(splits_dir, paste0("iter",mi,"_",tgt,"_",mth,"_split.rds")))
+  
+  png(file.path(plots_dir, paste0("bin_iter",mi,"_",tgt,"_",mth,".png")), width = 800, height = 600)
+  hist(y, breaks = 10, main = paste(tgt, mth), xlab = tgt)
+  abline(v = y[sp$val], col = "red", lty = 2)
+  dev.off()
+  
+  combo_res <- data.frame()
+  X_tr <- X_proc[sp$train, , drop = FALSE]; y_tr <- y[sp$train]
+  X_va <- X_proc[sp$val,   , drop = FALSE]; y_va <- y[sp$val]
+  
+  for (it in seq_len(inner_iters)) for (fd in folds) {
+    ctrl <- trainControl(method = "cv", number = fd, allowParallel = FALSE)
+    mdl  <- train(x = X_tr, y = y_tr, method = "pls", tuneLength = 20,
+                  trControl = ctrl, preProcess = c("center","scale"))
+    y_pr <- predict(mdl, newdata = X_va)
+    id   <- paste0("iter",mi,"_",tgt,"_",mth,"_fold",fd,"_rep",it)
+    saveRDS(mdl, file.path(model_dir, paste0(id,".rds")))
+    saveRDS(data.frame(True = y_va, Predicted = y_pr),
+            file.path(preds_dir, paste0(id,"_pred.rds")))
+    combo_res <- rbind(combo_res, data.frame(
+      Main_Iteration       = mi,
+      Target               = tgt,
+      Preprocessing        = mth,
+      Folds                = paste0(fd, " Fold"),
+      Iteration            = it,
+      Cross_Validated_R2   = max(mdl$results$Rsquared, na.rm = TRUE),
+      Cross_Validated_RMSE = min(mdl$results$RMSE,    na.rm = TRUE),
+      Validation_R2        = cor(y_pr, y_va)^2,
+      Validation_RMSE      = sqrt(mean((y_pr - y_va)^2)),
+      stringsAsFactors     = FALSE
+    ))
+  }
+  combo_res
+}
+
+# 10) Stop cluster
+stopCluster(cl)
+registerDoSEQ()
+
+# 11) Combine & save metrics
+final_results <- bind_rows(results_list)
+saveRDS(final_results, file.path(summary_dir, "final_results.rds"))
+write.xlsx(final_results, file.path(summary_dir, "final_results.xlsx"), rowNames = FALSE)
+
+# 12) Summary plots
+res_long <- pivot_longer(final_results,
+                         cols = c("Cross_Validated_R2","Cross_Validated_RMSE",
+                                  "Validation_R2","Validation_RMSE"),
+                         names_to = "Metric", values_to = "Value")
+
+p_all <- ggplot(res_long, aes(x = Folds, y = Value, fill = Preprocessing)) +
+  geom_boxplot() +
+  facet_wrap(~Metric + Target, scales = "free")
+ggsave(file.path(summary_dir, "combined_boxplots.png"), p_all, width = 12, height = 8)
+
+# 13) Runtime
+end_time <- Sys.time()
+cat("Total processing time: ", round(difftime(end_time, start_time, units = "mins"), 2), " minutes\n")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# # -----------------------------------
+# # Parallelized & Optimized Pipeline
+# # -----------------------------------
+# 
+# # 1) Load Libraries
+# library(readxl)
+# library(signal)
+# library(baseline)
+# library(ggplot2)
+# library(caret)
+# library(tidyr)
+# library(openxlsx)
+# library(stringr)
+# library(dplyr)
+# library(doParallel)
+# library(foreach)
+# library(pls)
+# 
+# set.seed(123)
+# start_time <- Sys.time()
+# 
+# # 2) Setup directories
+# setwd("/data/home/rdubey/NIRS_cali")
+# output_dir <- "model_outputs"
+# dirs <- c("models","predictions","splits","plots","summaries")
+# for (d in dirs) dir.create(file.path(output_dir, d), showWarnings = FALSE, recursive = TRUE)
+# model_dir   <- file.path(output_dir, "models")
+# preds_dir   <- file.path(output_dir, "predictions")
+# splits_dir  <- file.path(output_dir, "splits")
+# plots_dir   <- file.path(output_dir, "plots")
+# summary_dir <- file.path(output_dir, "summaries")
+# 
+# # 3) Load and preprocess data
+# spectral_data <- read_excel("absorbance_vc.xlsx")
+# chemdata      <- read_excel("hplc_vc.xlsx")
+# chemdata <- chemdata[, c("variety","Convicin_dry","Vicin_dry","VC dry","protein_dried")]
+# colnames(chemdata)[1] <- "Sample"
+# colnames(spectral_data)[2] <- "Sample"
+# chemdata$Sample <- as.character(chemdata$Sample)
+# spectral_data$Sample <- as.character(spectral_data$Sample)
+# 
+# orig <- c("Convicin_dry","Vicin_dry","VC dry","protein_dried")
+# new  <- c("Convicin","Vicin","VC","Protein")
+# keep <- orig %in% colnames(chemdata)
+# chemdata <- rename(chemdata, !!!setNames(orig[keep], new[keep]))
+# 
+# matched_data    <- inner_join(chemdata, spectral_data, by = "Sample")
+# spectral_matrix <- as.data.frame(lapply(matched_data[,-(1:7)], as.numeric))
+# spectral_matrix[is.na(spectral_matrix)] <- 0
+# 
+# # 4) Define preprocessing functions
+# apply_baseline_correction <- function(dat) {
+#   t(apply(dat, 1, function(x) baseline(matrix(x,1), method = "als")@corrected))
+# }
+# msc <- function(dat) {
+#   msp <- colMeans(dat)
+#   t(apply(dat, 1, function(x) {
+#     slope     <- sum((x - mean(x)) * (msp - mean(msp))) / sum((msp - mean(msp))^2)
+#     intercept <- mean(x) - slope * mean(msp)
+#     (x - intercept) / slope
+#   }))
+# }
+# snv <- function(dat) t(apply(dat, 1, function(x) (x - mean(x)) / sd(x)))
+# sg  <- function(dat, m, p, w) t(apply(dat, 1, function(x) sgolayfilt(x, p, w, m = m)))
+# 
+# sg_params <- expand.grid(m = c(0,1), p = c(2,3), w = c(5,7,9,11,15))
+# sg_params <- dplyr::filter(sg_params, w > p & w %% 2 == 1)
+# 
+# preprocess_list <- list(
+#   msc          = msc,
+#   snv          = snv,
+#   snv_msc      = function(d) msc(snv(d)),
+#   baseline_c   = apply_baseline_correction,
+#   base_snv_msc = function(d) msc(snv(apply_baseline_correction(d)))
+# )
+# for (i in seq_len(nrow(sg_params))) {
+#   m_i <- sg_params$m[i]; p_i <- sg_params$p[i]; w_i <- sg_params$w[i]
+#   
+#   key1 <- paste0("sg_m", m_i, "_p", p_i, "_w", w_i)
+#   preprocess_list[[key1]] <- local({
+#     m0 <- m_i; p0 <- p_i; w0 <- w_i
+#     function(dat) sg(dat, m0, p0, w0)
+#   })
+#   
+#   key2 <- paste0("snv_sg_m", m_i, "_p", p_i, "_w", w_i)
+#   preprocess_list[[key2]] <- local({
+#     m0 <- m_i; p0 <- p_i; w0 <- w_i
+#     function(dat) sg(snv(dat), m0, p0, w0)
+#   })
+#   
+#   key3 <- paste0("base_snv_sg_m", m_i, "_p", p_i, "_w", w_i)
+#   preprocess_list[[key3]] <- local({
+#     m0 <- m_i; p0 <- p_i; w0 <- w_i
+#     function(dat) sg(snv(apply_baseline_correction(dat)), m0, p0, w0)
+#   })
+# }
+# 
+# # 5) Splitting function
+# split_validation_by_bins <- function(y, n_bins = 10, n_per_bin = 1) {
+#   bc <- cut(y, breaks = n_bins, labels = FALSE)
+#   val <- unlist(lapply(1:n_bins, function(b) {
+#     idx <- which(bc == b)
+#     if (length(idx) >= n_per_bin) sample(idx, n_per_bin) else idx
+#   }))
+#   list(train = setdiff(seq_along(y), val), val = unique(val))
+# }
+# 
+# # 6) Modeling parameters
+# targets     <- c("Convicin","Vicin","VC","Protein")
+# folds       <- c(5,10,25,50)
+# main_iters  <- 10
+# inner_iters <- 25
+# 
+# # 7) Build outer grid
+# combos <- expand.grid(
+#   main_iter = 1:main_iters,
+#   target    = targets,
+#   method    = names(preprocess_list),
+#   stringsAsFactors = FALSE
+# )
+# 
+# # 8) Start cluster
+# closeAllConnections()
+# num_cores <- detectCores() - 10
+# cl <- makeCluster(num_cores)
+# registerDoParallel(cl)
+# clusterSetRNGStream(cl, 123)
+# clusterExport(cl, varlist = c(
+#   "matched_data","spectral_matrix","preprocess_list",
+#   "split_validation_by_bins","snv","msc","sg",
+#   "apply_baseline_correction","model_dir","preds_dir",
+#   "splits_dir","plots_dir","inner_iters","folds"
+# ))
+# 
+# # 9) Parallel foreach (outer loop)
+# results_list <- foreach(
+#   combo     = iter(combos, by = 'row'),
+#   .packages = c("caret","pls","dplyr","signal","baseline")
+# ) %dopar% {
+#   mi  <- combo$main_iter
+#   tgt <- combo$target
+#   mth <- combo$method
+#   
+#   y_full <- as.numeric(matched_data[[tgt]])
+#   valid  <- !is.na(y_full)
+#   y      <- y_full[valid]
+#   X_raw  <- spectral_matrix[valid, , drop = FALSE]
+#   
+#   Xp_raw <- preprocess_list[[mth]](X_raw)
+#   X_proc <- if (is.vector(Xp_raw)) matrix(Xp_raw, nrow = nrow(X_raw), byrow = TRUE) else as.matrix(Xp_raw)
+#   colnames(X_proc) <- colnames(X_raw)
+#   
+#   sp <- split_validation_by_bins(y)
+#   saveRDS(sp, file.path(splits_dir, paste0("iter",mi,"_",tgt,"_",mth,"_split.rds")))
+#   
+#   png(file.path(plots_dir, paste0("bin_iter",mi,"_",tgt,"_",mth,".png")), width=800, height=600)
+#   hist(y, breaks=10, main=paste(tgt,mth), xlab=tgt)
+#   abline(v=y[sp$val], col="red", lty=2)
+#   dev.off()
+#   
+#   combo_res <- data.frame()
+#   X_tr <- X_proc[sp$train, , drop=FALSE]; y_tr <- y[sp$train]
+#   X_va <- X_proc[sp$val,   , drop=FALSE]; y_va <- y[sp$val]
+#   
+#   for (it in seq_len(inner_iters)) for (fd in folds) {
+#     ctrl <- trainControl(method="cv", number=fd, allowParallel=FALSE)
+#     mdl  <- train(x=X_tr, y=y_tr, method="pls", tuneLength=20, trControl=ctrl, preProcess=c("center","scale"))
+#     y_pr <- predict(mdl, newdata=X_va)
+#     id   <- paste0("iter",mi,"_",tgt,"_",mth,"_fold",fd,"_rep",it)
+#     saveRDS(mdl, file.path(model_dir, paste0(id,".rds")))
+#     saveRDS(data.frame(True=y_va,Predicted=y_pr), file.path(preds_dir, paste0(id,"_pred.rds")))
+#     combo_res <- rbind(combo_res, data.frame(
+#       Main_Iteration=mi,Target=tgt,Preprocessing=mth,Folds=paste0(fd," Fold"),Iteration=it,
+#       Cross_Validated_R2=max(mdl$results$Rsquared,na.rm=TRUE),
+#       Cross_Validated_RMSE=min(mdl$results$RMSE,na.rm=TRUE),
+#       Validation_R2=cor(y_pr,y_va)^2,
+#       Validation_RMSE=sqrt(mean((y_pr-y_va)^2)),stringsAsFactors=FALSE
+#     ))
+#   }
+#   combo_res
+# }
+# 
+# # 10) Stop cluster
+# stopCluster(cl)
+# registerDoSEQ()
+# 
+# # 11) Combine & save metrics
+# final_results <- bind_rows(results_list)
+# saveRDS(final_results, file.path(summary_dir, "final_results.rds"))
+# write.xlsx(final_results, file.path(summary_dir, "final_results.xlsx"), rowNames=FALSE)
+# 
+# # 12) Summary plots
+# res_long <- pivot_longer(final_results,
+#                          cols=c("Cross_Validated_R2","Cross_Validated_RMSE","Validation_R2","Validation_RMSE"),
+#                          names_to="Metric",values_to="Value")
+# 
+# p_all <- ggplot(res_long, aes(x=Folds, y=Value, fill=Preprocessing)) +
+#   geom_boxplot() +
+#   facet_wrap(~Metric+Target, scales="free")
+# ggsave(file.path(summary_dir, "combined_boxplots.png"), p_all, width=12, height=8)
+# 
+# # 13) Runtime
+# end_time <- Sys.time()
+# cat("Total processing time:", round(difftime(end_time, start_time, units="mins"),2), "minutes\n")
